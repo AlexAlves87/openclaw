@@ -1,0 +1,524 @@
+using System;
+using System.Collections.Generic;
+using System.Linq;
+using System.Threading;
+using System.Threading.Tasks;
+using OpenClaw.Shared;
+using OpenClaw.Shared.Capabilities;
+using Windows.Devices.Enumeration;
+using Windows.Foundation;
+using Windows.Graphics.Imaging;
+using Windows.Media;
+using Windows.Media.Capture;
+using Windows.Media.Capture.Frames;
+using Windows.Media.MediaProperties;
+using Windows.Storage.Streams;
+
+namespace OpenClawTray.Services;
+
+/// <summary>
+/// Camera capture service using Windows.Media.Capture
+/// </summary>
+public class CameraCaptureService : IDisposable
+{
+    private readonly IOpenClawLogger _logger;
+    private readonly SemaphoreSlim _captureLock = new(1, 1);
+    
+    public CameraCaptureService(IOpenClawLogger logger)
+    {
+        _logger = logger;
+    }
+    
+    public void Dispose()
+    {
+        _captureLock.Dispose();
+    }
+    
+    public async Task<CameraInfo[]> ListCamerasAsync()
+    {
+        var devices = await DeviceInformation.FindAllAsync(DeviceClass.VideoCapture);
+        var result = new List<CameraInfo>();
+        
+        for (var i = 0; i < devices.Count; i++)
+        {
+            var device = devices[i];
+            result.Add(new CameraInfo
+            {
+                DeviceId = device.Id,
+                Name = device.Name,
+                IsDefault = i == 0
+            });
+        }
+        
+        return result.ToArray();
+    }
+    
+    public async Task<CameraSnapResult> SnapAsync(CameraSnapArgs args)
+    {
+        _logger.Info($"camera.snap start: deviceId={args.DeviceId ?? "(default)"}, format={args.Format}, maxWidth={args.MaxWidth}, quality={args.Quality}");
+        await _captureLock.WaitAsync();
+        
+        try
+        {
+            var format = NormalizeFormat(args.Format);
+            _logger.Info($"camera.snap: initializing MediaCapture (format={format})");
+            using var capture = new MediaCapture();
+            
+            var settings = new MediaCaptureInitializationSettings
+            {
+                VideoDeviceId = args.DeviceId,
+                MemoryPreference = MediaCaptureMemoryPreference.Cpu,
+                StreamingCaptureMode = StreamingCaptureMode.Video,
+                PhotoCaptureSource = PhotoCaptureSource.Auto
+            };
+            
+            var initStart = DateTime.UtcNow;
+            await capture.InitializeAsync(settings);
+            _logger.Info($"camera.snap: MediaCapture initialized in {(DateTime.UtcNow - initStart).TotalMilliseconds:0}ms");
+            
+            var photoCandidates = SelectPhotoEncodings(capture, format, args.MaxWidth);
+            if (photoCandidates.Count == 0)
+            {
+                _logger.Warn("camera.snap: no photo stream properties available; falling back to video frame");
+                return await CaptureVideoFallbackAsync(capture, format, args.MaxWidth, args.Quality);
+            }
+            
+            using var stream = new InMemoryRandomAccessStream();
+            _logger.Info($"camera.snap: preferred encoding {photoCandidates[0].Subtype} {photoCandidates[0].Width}x{photoCandidates[0].Height}");
+            
+            var captureStart = DateTime.UtcNow;
+            var encoding = await CaptureWithFallbackAsync(capture, photoCandidates);
+            if (encoding == null)
+            {
+                _logger.Warn("camera.snap: no supported photo encodings; falling back to video frame");
+                return await CaptureVideoFallbackAsync(capture, format, args.MaxWidth, args.Quality);
+            }
+            
+            try
+            {
+                await capture.CapturePhotoToStreamAsync(encoding, stream);
+            }
+            catch (Exception ex) when (IsInvalidMediaType(ex))
+            {
+                _logger.Warn("camera.snap: photo capture unsupported; falling back to video frame");
+                return await CaptureVideoFallbackAsync(capture, format, args.MaxWidth, args.Quality);
+            }
+            _logger.Info($"camera.snap: CapturePhotoToStreamAsync completed in {(DateTime.UtcNow - captureStart).TotalMilliseconds:0}ms");
+            
+            stream.Seek(0);
+            var encodeStart = DateTime.UtcNow;
+            var result = await EncodeAsync(stream, format, args.MaxWidth, args.Quality);
+            _logger.Info($"camera.snap: encoded {result.Width}x{result.Height} ({result.Base64.Length} chars) in {(DateTime.UtcNow - encodeStart).TotalMilliseconds:0}ms");
+            return result;
+        }
+        catch (UnauthorizedAccessException ex)
+        {
+            _logger.Error("Camera access denied. Check Windows privacy settings.", ex);
+            throw;
+        }
+        catch (Exception ex)
+        {
+            _logger.Error($"camera.snap failed (0x{ex.HResult:X8})", ex);
+            throw;
+        }
+        finally
+        {
+            _captureLock.Release();
+        }
+    }
+    
+    private async Task<ImageEncodingProperties?> CaptureWithFallbackAsync(
+        MediaCapture capture,
+        List<ImageEncodingProperties> candidates)
+    {
+        foreach (var candidate in candidates)
+        {
+            try
+            {
+                await capture.VideoDeviceController.SetMediaStreamPropertiesAsync(MediaStreamType.Photo, candidate);
+                _logger.Info($"camera.snap: using photo encoding {candidate.Subtype} {candidate.Width}x{candidate.Height}");
+                return candidate;
+            }
+            catch (Exception ex) when (IsInvalidMediaType(ex))
+            {
+                _logger.Warn($"camera.snap: photo encoding {candidate.Subtype} {candidate.Width}x{candidate.Height} not supported");
+            }
+        }
+        
+        return null;
+    }
+    
+    private static bool IsInvalidMediaType(Exception ex)
+    {
+        const int MfEInvalidMediaType = unchecked((int)0xC00D36B4);
+        return ex.HResult == MfEInvalidMediaType;
+    }
+
+    private static List<ImageEncodingProperties> SelectPhotoEncodings(MediaCapture capture, string format, int maxWidth)
+    {
+        var props = capture.VideoDeviceController
+            .GetAvailableMediaStreamProperties(MediaStreamType.Photo)
+            .OfType<ImageEncodingProperties>()
+            .ToList();
+        
+        if (props.Count == 0)
+        {
+            return new List<ImageEncodingProperties>();
+        }
+        
+        string[] desired = format == "png"
+            ? new[] { "PNG" }
+            : new[] { "JPEG", "JPG", "MJPG" };
+        
+        var candidates = props
+            .Where(p => desired.Contains(p.Subtype, StringComparer.OrdinalIgnoreCase))
+            .ToList();
+        
+        if (candidates.Count == 0)
+        {
+            candidates = props;
+        }
+        
+        var filtered = maxWidth > 0
+            ? candidates.Where(p => p.Width <= maxWidth).ToList()
+            : candidates;
+        
+        return (filtered.Count > 0 ? filtered : candidates)
+            .OrderByDescending(p => p.Width)
+            .ThenByDescending(p => p.Height)
+            .ToList();
+    }
+    
+    private static VideoEncodingProperties? SelectPreviewEncoding(MediaCapture capture, int maxWidth)
+    {
+        var props = capture.VideoDeviceController
+            .GetAvailableMediaStreamProperties(MediaStreamType.VideoPreview)
+            .OfType<VideoEncodingProperties>()
+            .ToList();
+        
+        if (props.Count == 0)
+        {
+            return null;
+        }
+        
+        var filtered = maxWidth > 0
+            ? props.Where(p => p.Width <= maxWidth).ToList()
+            : props;
+        
+        return (filtered.Count > 0 ? filtered : props)
+            .OrderByDescending(p => p.Width)
+            .ThenByDescending(p => p.Height)
+            .FirstOrDefault();
+    }
+    
+    private async Task<CameraSnapResult> CaptureVideoFallbackAsync(
+        MediaCapture capture,
+        string format,
+        int maxWidth,
+        int quality)
+    {
+        try
+        {
+            return await CaptureFrameReaderAsync(capture, format, maxWidth, quality);
+        }
+        catch (Exception ex)
+        {
+            _logger.Warn($"camera.snap: frame reader fallback failed (0x{ex.HResult:X8}): {ex.Message}");
+        }
+        
+        _logger.Warn("camera.snap: frame reader unavailable; falling back to preview frame");
+        return await CapturePreviewFrameAsync(capture, format, maxWidth, quality);
+    }
+    
+    private async Task<CameraSnapResult> CaptureFrameReaderAsync(
+        MediaCapture capture,
+        string format,
+        int maxWidth,
+        int quality)
+    {
+        _logger.Info($"camera.snap: frame sources={capture.FrameSources.Count}");
+        var sources = capture.FrameSources.Values
+            .Where(s => s.Info.SourceKind == MediaFrameSourceKind.Color)
+            .OrderByDescending(s => s.Info.MediaStreamType == MediaStreamType.VideoRecord ? 1 : 0)
+            .ToList();
+        var source = sources.FirstOrDefault();
+        if (source == null)
+        {
+            throw new InvalidOperationException("No color frame source available");
+        }
+        
+        MediaFrameReader? frameReader = null;
+        try
+        {
+            var selectedFormat = SelectFrameReaderFormat(source, maxWidth);
+            if (selectedFormat != null)
+            {
+                _logger.Info($"camera.snap: frame format {selectedFormat.Subtype} {selectedFormat.VideoFormat.Width}x{selectedFormat.VideoFormat.Height}");
+                await source.SetFormatAsync(selectedFormat);
+            }
+            
+            try
+            {
+                frameReader = selectedFormat != null
+                    ? await capture.CreateFrameReaderAsync(source, selectedFormat.Subtype)
+                    : await capture.CreateFrameReaderAsync(source);
+            }
+            catch
+            {
+                frameReader = await capture.CreateFrameReaderAsync(source);
+            }
+            
+            var tcs = new TaskCompletionSource<SoftwareBitmap>(TaskCreationOptions.RunContinuationsAsynchronously);
+            void OnFrameArrived(MediaFrameReader sender, MediaFrameArrivedEventArgs args)
+            {
+                if (tcs.Task.IsCompleted)
+                {
+                    return;
+                }
+                
+                using var frame = sender.TryAcquireLatestFrame();
+                var bitmap = frame?.VideoMediaFrame?.SoftwareBitmap;
+                if (bitmap == null)
+                {
+                    return;
+                }
+                
+                var copied = SoftwareBitmap.Convert(bitmap, bitmap.BitmapPixelFormat, bitmap.BitmapAlphaMode);
+                tcs.TrySetResult(copied);
+            }
+            
+            frameReader.FrameArrived += OnFrameArrived;
+            
+            var status = await frameReader.StartAsync();
+            if (status != MediaFrameReaderStartStatus.Success)
+            {
+                throw new InvalidOperationException($"Frame reader start failed: {status}");
+            }
+            
+            using var timeoutCts = new CancellationTokenSource(TimeSpan.FromSeconds(2));
+            await using var reg = timeoutCts.Token.Register(() => tcs.TrySetCanceled());
+            
+            var bitmap = await tcs.Task;
+            frameReader.FrameArrived -= OnFrameArrived;
+            await frameReader.StopAsync();
+            
+            return await EncodeSoftwareBitmapAsync(bitmap, format, maxWidth, quality);
+        }
+        finally
+        {
+            frameReader?.Dispose();
+        }
+    }
+    
+    private static MediaFrameFormat? SelectFrameReaderFormat(MediaFrameSource source, int maxWidth)
+    {
+        var formats = source.SupportedFormats;
+        if (formats.Count == 0)
+        {
+            return null;
+        }
+        
+        var preferred = new[]
+        {
+            MediaEncodingSubtypes.Bgra8,
+            MediaEncodingSubtypes.Nv12,
+            MediaEncodingSubtypes.Yuy2,
+            MediaEncodingSubtypes.Mjpg
+        };
+        
+        foreach (var subtype in preferred)
+        {
+            var match = formats.FirstOrDefault(f =>
+                string.Equals(f.Subtype, subtype, StringComparison.OrdinalIgnoreCase));
+            if (match != null)
+            {
+                return match;
+            }
+        }
+        
+        var filtered = maxWidth > 0
+            ? formats.Where(f => f.VideoFormat.Width <= maxWidth).ToList()
+            : formats.ToList();
+        
+        return (filtered.Count > 0 ? filtered : formats)
+            .OrderByDescending(f => f.VideoFormat.Width)
+            .ThenByDescending(f => f.VideoFormat.Height)
+            .FirstOrDefault();
+    }
+    
+    private async Task<CameraSnapResult> CapturePreviewFrameAsync(
+        MediaCapture capture,
+        string format,
+        int maxWidth,
+        int quality)
+    {
+        var previewEncoding = SelectPreviewEncoding(capture, maxWidth);
+        if (previewEncoding != null)
+        {
+            await capture.VideoDeviceController.SetMediaStreamPropertiesAsync(MediaStreamType.VideoPreview, previewEncoding);
+            _logger.Info($"camera.snap: preview encoding {previewEncoding.Subtype} {previewEncoding.Width}x{previewEncoding.Height}");
+        }
+        else
+        {
+            _logger.Warn("camera.snap: no preview stream properties; using default preview settings");
+        }
+        
+        _logger.Info("camera.snap: starting preview");
+        await capture.StartPreviewAsync();
+        _logger.Info("camera.snap: preview started");
+        try
+        {
+            var activePreview = capture.VideoDeviceController.GetMediaStreamProperties(MediaStreamType.VideoPreview) as VideoEncodingProperties;
+            var width = (int)(activePreview?.Width ?? previewEncoding?.Width ?? 1280);
+            var height = (int)(activePreview?.Height ?? previewEncoding?.Height ?? 720);
+            if (width <= 0 || height <= 0)
+            {
+                width = 1280;
+                height = 720;
+            }
+            
+            var subtype = activePreview?.Subtype ?? previewEncoding?.Subtype;
+            var pixelFormat = GetPreviewPixelFormat(subtype);
+            _logger.Info($"camera.snap: grabbing preview frame {width}x{height} ({subtype ?? "default"})");
+            using var frame = new VideoFrame(pixelFormat, width, height);
+            await capture.GetPreviewFrameAsync(frame);
+            var bitmap = frame.SoftwareBitmap ?? throw new InvalidOperationException("Preview frame missing bitmap");
+            SoftwareBitmap? converted = null;
+            if (bitmap.BitmapPixelFormat != BitmapPixelFormat.Bgra8)
+            {
+                converted = SoftwareBitmap.Convert(bitmap, BitmapPixelFormat.Bgra8, BitmapAlphaMode.Ignore);
+                bitmap = converted;
+            }
+            
+            using var previewStream = new InMemoryRandomAccessStream();
+            var encoder = await BitmapEncoder.CreateAsync(BitmapEncoder.PngEncoderId, previewStream);
+            encoder.SetSoftwareBitmap(bitmap);
+            await encoder.FlushAsync();
+            previewStream.Seek(0);
+            
+            return await EncodeAsync(previewStream, format, maxWidth, quality);
+        }
+        finally
+        {
+            _logger.Info("camera.snap: stopping preview");
+            await capture.StopPreviewAsync();
+        }
+    }
+    
+    private async Task<CameraSnapResult> EncodeSoftwareBitmapAsync(
+        SoftwareBitmap bitmap,
+        string format,
+        int maxWidth,
+        int quality)
+    {
+        SoftwareBitmap? converted = null;
+        if (bitmap.BitmapPixelFormat != BitmapPixelFormat.Bgra8)
+        {
+            converted = SoftwareBitmap.Convert(bitmap, BitmapPixelFormat.Bgra8, BitmapAlphaMode.Ignore);
+            bitmap = converted;
+        }
+        
+        using var stream = new InMemoryRandomAccessStream();
+        var encoder = await BitmapEncoder.CreateAsync(BitmapEncoder.PngEncoderId, stream);
+        encoder.SetSoftwareBitmap(bitmap);
+        await encoder.FlushAsync();
+        stream.Seek(0);
+        
+        return await EncodeAsync(stream, format, maxWidth, quality);
+    }
+    
+    private static BitmapPixelFormat GetPreviewPixelFormat(string? subtype)
+    {
+        if (string.Equals(subtype, MediaEncodingSubtypes.Yuy2, StringComparison.OrdinalIgnoreCase))
+        {
+            return BitmapPixelFormat.Yuy2;
+        }
+        
+        if (string.Equals(subtype, MediaEncodingSubtypes.Nv12, StringComparison.OrdinalIgnoreCase))
+        {
+            return BitmapPixelFormat.Nv12;
+        }
+        
+        return BitmapPixelFormat.Bgra8;
+    }
+    
+    private static string NormalizeFormat(string? format)
+    {
+        var normalized = (format ?? "jpeg").Trim().ToLowerInvariant();
+        if (normalized == "jpg") normalized = "jpeg";
+        if (normalized != "jpeg" && normalized != "png") normalized = "jpeg";
+        return normalized;
+    }
+    
+    private static async Task<CameraSnapResult> EncodeAsync(
+        IRandomAccessStream input,
+        string format,
+        int maxWidth,
+        int quality)
+    {
+        var decoder = await BitmapDecoder.CreateAsync(input);
+        var width = decoder.PixelWidth;
+        var height = decoder.PixelHeight;
+        
+        uint targetWidth = width;
+        uint targetHeight = height;
+        if (maxWidth > 0 && width > maxWidth)
+        {
+            var scale = (double)maxWidth / width;
+            targetWidth = (uint)maxWidth;
+            targetHeight = (uint)Math.Max(1, Math.Round(height * scale));
+        }
+        
+        var transform = new BitmapTransform
+        {
+            ScaledWidth = targetWidth,
+            ScaledHeight = targetHeight
+        };
+        
+        var pixelData = await decoder.GetPixelDataAsync(
+            BitmapPixelFormat.Bgra8,
+            BitmapAlphaMode.Ignore,
+            transform,
+            ExifOrientationMode.IgnoreExifOrientation,
+            ColorManagementMode.DoNotColorManage);
+        
+        using var output = new InMemoryRandomAccessStream();
+        var encoderId = format == "png" ? BitmapEncoder.PngEncoderId : BitmapEncoder.JpegEncoderId;
+        var encoder = await BitmapEncoder.CreateAsync(encoderId, output);
+        
+        encoder.SetPixelData(
+            BitmapPixelFormat.Bgra8,
+            BitmapAlphaMode.Ignore,
+            targetWidth,
+            targetHeight,
+            decoder.DpiX,
+            decoder.DpiY,
+            pixelData.DetachPixelData());
+        
+        if (format == "jpeg")
+        {
+            var qualityValue = Math.Clamp(quality / 100.0, 0.0, 1.0);
+            var props = new BitmapPropertySet
+            {
+                { "ImageQuality", new BitmapTypedValue(qualityValue, PropertyType.Single) }
+            };
+            await encoder.BitmapProperties.SetPropertiesAsync(props);
+        }
+        
+        await encoder.FlushAsync();
+        output.Seek(0);
+        
+        var bytes = new byte[output.Size];
+        using var reader = new DataReader(output);
+        await reader.LoadAsync((uint)output.Size);
+        reader.ReadBytes(bytes);
+        
+        return new CameraSnapResult
+        {
+            Format = format,
+            Width = (int)targetWidth,
+            Height = (int)targetHeight,
+            Base64 = Convert.ToBase64String(bytes)
+        };
+    }
+}

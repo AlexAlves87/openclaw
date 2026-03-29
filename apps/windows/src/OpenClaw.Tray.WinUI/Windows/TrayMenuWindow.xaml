@@ -1,0 +1,23 @@
+<?xml version="1.0" encoding="utf-8"?>
+<winex:WindowEx
+    x:Class="OpenClawTray.Windows.TrayMenuWindow"
+    xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+    xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+    xmlns:winex="using:WinUIEx"
+    Title="OpenClaw Menu"
+    Width="280"
+    Height="400">
+
+    <!-- Backdrop disabled - causes crashes after idle periods -->
+
+    <Border Background="{ThemeResource AcrylicBackgroundFillColorDefaultBrush}"
+            BorderBrush="{ThemeResource SurfaceStrokeColorDefaultBrush}"
+            BorderThickness="1"
+            CornerRadius="8">
+        <ScrollViewer VerticalScrollBarVisibility="Auto">
+            <StackPanel x:Name="MenuPanel" Padding="4,6">
+                <!-- Menu items will be added programmatically -->
+            </StackPanel>
+        </ScrollViewer>
+    </Border>
+</winex:WindowEx>

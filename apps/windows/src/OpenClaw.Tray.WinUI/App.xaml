@@ -1,0 +1,25 @@
+<?xml version="1.0" encoding="utf-8"?>
+<Application
+    x:Class="OpenClawTray.App"
+    xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+    xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+    xmlns:local="using:OpenClawTray">
+    <Application.Resources>
+        <ResourceDictionary>
+            <ResourceDictionary.MergedDictionaries>
+                <XamlControlsResources xmlns="using:Microsoft.UI.Xaml.Controls" />
+            </ResourceDictionary.MergedDictionaries>
+            
+            <!-- Custom OpenClaw Theme Resources -->
+            <SolidColorBrush x:Key="LobsterAccentBrush" Color="#E74C3C" />
+            <SolidColorBrush x:Key="LobsterAccentBrushHover" Color="#C0392B" />
+            
+            <!-- Custom Button Style -->
+            <Style x:Key="AccentButtonStyle" TargetType="Button">
+                <Setter Property="Background" Value="{StaticResource LobsterAccentBrush}" />
+                <Setter Property="Foreground" Value="White" />
+                <Setter Property="CornerRadius" Value="4" />
+            </Style>
+        </ResourceDictionary>
+    </Application.Resources>
+</Application>

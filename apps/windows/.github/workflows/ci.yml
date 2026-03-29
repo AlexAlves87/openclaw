@@ -1,0 +1,427 @@
+name: Build and Test
+
+on:
+  push:
+    branches: [ master, main ]
+    tags: [ 'v*' ]
+  pull_request:
+    branches: [ master, main ]
+
+jobs:
+  test:
+    runs-on: windows-latest
+    steps:
+    - uses: actions/checkout@v4
+      with:
+        fetch-depth: 0
+
+    - name: Setup .NET 10
+      uses: actions/setup-dotnet@v4
+      with:
+        dotnet-version: 10.0.x
+
+    - name: Cache NuGet packages
+      uses: actions/cache@v4
+      with:
+        path: ~/.nuget/packages
+        key: nuget-${{ runner.os }}-${{ hashFiles('**/*.csproj') }}
+        restore-keys: nuget-${{ runner.os }}-
+
+    - name: Install GitVersion
+      uses: gittools/actions/gitversion/setup@v4
+      with:
+        versionSpec: '6.4.x'
+
+    - name: Determine Version
+      id: gitversion
+      uses: gittools/actions/gitversion/execute@v4
+
+    - name: Restore dependencies
+      run: dotnet restore
+
+    - name: Build Shared Library
+      run: dotnet build src/OpenClaw.Shared -c Debug
+
+    - name: Build Tray App (WinUI)
+      run: dotnet build src/OpenClaw.Tray.WinUI -c Debug -r win-x64
+
+    - name: Build Tests
+      run: |
+        dotnet build tests/OpenClaw.Shared.Tests -c Debug
+        dotnet build tests/OpenClaw.Tray.Tests -c Debug
+
+    - name: Run Tests
+      run: |
+        dotnet test tests/OpenClaw.Shared.Tests --no-build -c Debug --verbosity normal
+        dotnet test tests/OpenClaw.Tray.Tests --no-build -c Debug --verbosity normal
+
+    outputs:
+      semVer: ${{ steps.gitversion.outputs.semVer }}
+      majorMinorPatch: ${{ steps.gitversion.outputs.majorMinorPatch }}
+
+  build:
+    needs: test
+    runs-on: ${{ matrix.rid == 'win-arm64' && 'windows-11-arm' || 'windows-latest' }}
+    strategy:
+      matrix:
+        rid: [win-x64, win-arm64]
+
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Setup .NET 10
+      uses: actions/setup-dotnet@v4
+      with:
+        dotnet-version: 10.0.x
+
+    - name: Restore WinUI Tray App
+      run: dotnet restore src/OpenClaw.Tray.WinUI -r ${{ matrix.rid }}
+
+    - name: Build WinUI Tray App (Release)
+      run: dotnet build src/OpenClaw.Tray.WinUI --no-restore -c Release -r ${{ matrix.rid }} -p:Version=${{ needs.test.outputs.semVer }}
+
+    - name: Publish WinUI Tray App
+      run: dotnet publish src/OpenClaw.Tray.WinUI -c Release -r ${{ matrix.rid }} --self-contained -p:Version=${{ needs.test.outputs.semVer }} -o publish
+
+    - name: Azure Login for Signing
+      if: startsWith(github.ref, 'refs/tags/v') && matrix.rid != 'win-arm64'
+      uses: azure/login@v2
+      with:
+        creds: '{"clientId":"${{ secrets.AZURE_CLIENT_ID }}","clientSecret":"${{ secrets.AZURE_CLIENT_SECRET }}","subscriptionId":"${{ secrets.AZURE_SUBSCRIPTION_ID }}","tenantId":"${{ secrets.AZURE_TENANT_ID }}"}'
+
+    - name: Sign Executable
+      if: startsWith(github.ref, 'refs/tags/v') && matrix.rid != 'win-arm64'
+      uses: azure/trusted-signing-action@v1
+      with:
+        azure-tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+        azure-client-id: ${{ secrets.AZURE_CLIENT_ID }}
+        azure-client-secret: ${{ secrets.AZURE_CLIENT_SECRET }}
+        endpoint: https://wus2.codesigning.azure.net/
+        signing-account-name: hanselman
+        certificate-profile-name: WindowsEdgeLight
+        files-folder: publish
+        files-folder-filter: exe
+        file-digest: SHA256
+        timestamp-rfc3161: http://timestamp.acs.microsoft.com
+        timestamp-digest: SHA256
+
+    - name: Upload Tray Artifact
+      uses: actions/upload-artifact@v4
+      with:
+        name: openclaw-tray-${{ matrix.rid }}
+        path: publish/
+
+  build-msix:
+    needs: test
+    runs-on: ${{ matrix.rid == 'win-arm64' && 'windows-11-arm' || 'windows-latest' }}
+    continue-on-error: true
+    strategy:
+      fail-fast: false
+      matrix:
+        rid: [win-x64, win-arm64]
+        include:
+          - rid: win-x64
+            platform: x64
+          - rid: win-arm64
+            platform: ARM64
+
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Setup .NET 10
+      uses: actions/setup-dotnet@v4
+      with:
+        dotnet-version: 10.0.x
+
+    - name: Setup MSBuild
+      uses: microsoft/setup-msbuild@v2
+
+    - name: Restore
+      run: dotnet restore src/OpenClaw.Tray.WinUI -r ${{ matrix.rid }}
+
+    - name: Patch MSIX manifest version
+      shell: pwsh
+      run: |
+        $version = "${{ needs.test.outputs.majorMinorPatch }}.0"
+        $manifest = "src/OpenClaw.Tray.WinUI/Package.appxmanifest"
+        [xml]$xml = Get-Content $manifest
+        $xml.Package.Identity.Version = $version
+        $xml.Save((Resolve-Path $manifest))
+        Write-Host "Patched MSIX manifest version to $version"
+
+    - name: Build MSIX Package
+      run: >
+        msbuild src/OpenClaw.Tray.WinUI/OpenClaw.Tray.WinUI.csproj
+        /p:Configuration=Release
+        /p:RuntimeIdentifier=${{ matrix.rid }}
+        /p:Platform=${{ matrix.platform }}
+        /p:PackageMsix=true
+        /p:GenerateAppxPackageOnBuild=true
+        /p:AppxPackageSigningEnabled=false
+        /p:AppxBundle=Never
+        /p:UapAppxPackageBuildMode=SideloadOnly
+        /p:Version=${{ needs.test.outputs.majorMinorPatch }}
+        /p:AppxPackageDir=AppPackages\
+
+    - name: Find MSIX Package
+      id: find-msix
+      shell: pwsh
+      run: |
+        $msix = Get-ChildItem -Path src/OpenClaw.Tray.WinUI/AppPackages -Recurse -Filter "*.msix" -ErrorAction SilentlyContinue | Select-Object -First 1
+        if (-not $msix) {
+          Write-Error "No MSIX package found in AppPackages directory"
+          exit 1
+        }
+        Write-Host "Found: $($msix.FullName)"
+        echo "msix_path=$($msix.FullName)" >> $env:GITHUB_OUTPUT
+        echo "msix_name=$($msix.Name)" >> $env:GITHUB_OUTPUT
+
+    - name: Sign MSIX
+      if: startsWith(github.ref, 'refs/tags/v') && matrix.rid != 'win-arm64'
+      uses: azure/login@v2
+      with:
+        creds: '{"clientId":"${{ secrets.AZURE_CLIENT_ID }}","clientSecret":"${{ secrets.AZURE_CLIENT_SECRET }}","subscriptionId":"${{ secrets.AZURE_SUBSCRIPTION_ID }}","tenantId":"${{ secrets.AZURE_TENANT_ID }}"}'
+
+    - name: Sign MSIX Package
+      if: startsWith(github.ref, 'refs/tags/v') && matrix.rid != 'win-arm64'
+      uses: azure/trusted-signing-action@v1
+      with:
+        azure-tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+        azure-client-id: ${{ secrets.AZURE_CLIENT_ID }}
+        azure-client-secret: ${{ secrets.AZURE_CLIENT_SECRET }}
+        endpoint: https://wus2.codesigning.azure.net/
+        signing-account-name: hanselman
+        certificate-profile-name: WindowsEdgeLight
+        files-folder: src/OpenClaw.Tray.WinUI/AppPackages
+        files-folder-filter: msix
+        files-folder-depth: 3
+        file-digest: SHA256
+        timestamp-rfc3161: http://timestamp.acs.microsoft.com
+        timestamp-digest: SHA256
+
+    - name: Upload MSIX Artifact
+      uses: actions/upload-artifact@v4
+      with:
+        name: openclaw-msix-${{ matrix.rid }}
+        path: ${{ steps.find-msix.outputs.msix_path }}
+
+  build-extension:
+    needs: test
+    runs-on: windows-latest
+    strategy:
+      matrix:
+        platform: [x64, arm64]
+
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Setup .NET 10
+      uses: actions/setup-dotnet@v4
+      with:
+        dotnet-version: 10.0.x
+
+    - name: Restore Command Palette Extension
+      run: dotnet restore src/OpenClaw.CommandPalette
+
+    - name: Build Command Palette Extension
+      run: dotnet build src/OpenClaw.CommandPalette -c Debug -p:Platform=${{ matrix.platform }}
+
+    - name: Upload Extension Artifact
+      uses: actions/upload-artifact@v4
+      with:
+        name: openclaw-commandpalette-${{ matrix.platform }}
+        path: src/OpenClaw.CommandPalette/bin/${{ matrix.platform }}/Debug/
+
+  release:
+    needs: [test, build, build-msix, build-extension]
+    if: startsWith(github.ref, 'refs/tags/v') && !cancelled()
+    runs-on: windows-latest
+    permissions:
+      contents: write
+
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Download win-x64 tray artifact
+      uses: actions/download-artifact@v4
+      with:
+        name: openclaw-tray-win-x64
+        path: artifacts/tray-win-x64
+
+    - name: Download win-arm64 tray artifact
+      uses: actions/download-artifact@v4
+      with:
+        name: openclaw-tray-win-arm64
+        path: artifacts/tray-win-arm64
+
+    - name: Download win-x64 cmdpal artifact
+      uses: actions/download-artifact@v4
+      with:
+        name: openclaw-commandpalette-x64
+        path: artifacts/cmdpal-x64
+
+    - name: Download win-arm64 cmdpal artifact
+      uses: actions/download-artifact@v4
+      with:
+        name: openclaw-commandpalette-arm64
+        path: artifacts/cmdpal-arm64
+
+    - name: Download win-x64 MSIX artifact
+      uses: actions/download-artifact@v4
+      continue-on-error: true
+      id: msix-x64
+      with:
+        name: openclaw-msix-win-x64
+        path: artifacts/msix-x64
+
+    - name: Download win-arm64 MSIX artifact
+      uses: actions/download-artifact@v4
+      continue-on-error: true
+      id: msix-arm64
+      with:
+        name: openclaw-msix-win-arm64
+        path: artifacts/msix-arm64
+
+    - name: Rename MSIX packages
+      if: steps.msix-x64.outcome == 'success' || steps.msix-arm64.outcome == 'success'
+      shell: pwsh
+      run: |
+        $x64 = Get-ChildItem -Path artifacts/msix-x64 -Filter "*.msix" | Select-Object -First 1
+        $arm64 = Get-ChildItem -Path artifacts/msix-arm64 -Filter "*.msix" | Select-Object -First 1
+        if ($x64) { Copy-Item $x64.FullName "OpenClawTray-${{ needs.test.outputs.majorMinorPatch }}-win-x64.msix" }
+        if ($arm64) { Copy-Item $arm64.FullName "OpenClawTray-${{ needs.test.outputs.majorMinorPatch }}-win-arm64.msix" }
+
+    # Sign ARM64 artifacts on x64 runner (ARM64 runner can't run the signing dlib)
+    - name: Azure Login for ARM64 Signing
+      uses: azure/login@v2
+      with:
+        creds: '{"clientId":"${{ secrets.AZURE_CLIENT_ID }}","clientSecret":"${{ secrets.AZURE_CLIENT_SECRET }}","subscriptionId":"${{ secrets.AZURE_SUBSCRIPTION_ID }}","tenantId":"${{ secrets.AZURE_TENANT_ID }}"}'
+
+    - name: Sign ARM64 Executables
+      uses: azure/trusted-signing-action@v1
+      with:
+        azure-tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+        azure-client-id: ${{ secrets.AZURE_CLIENT_ID }}
+        azure-client-secret: ${{ secrets.AZURE_CLIENT_SECRET }}
+        endpoint: https://wus2.codesigning.azure.net/
+        signing-account-name: hanselman
+        certificate-profile-name: WindowsEdgeLight
+        files-folder: artifacts/tray-win-arm64
+        files-folder-filter: exe
+        file-digest: SHA256
+        timestamp-rfc3161: http://timestamp.acs.microsoft.com
+        timestamp-digest: SHA256
+
+    - name: Sign ARM64 MSIX
+      if: steps.msix-arm64.outcome == 'success'
+      uses: azure/trusted-signing-action@v1
+      with:
+        azure-tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+        azure-client-id: ${{ secrets.AZURE_CLIENT_ID }}
+        azure-client-secret: ${{ secrets.AZURE_CLIENT_SECRET }}
+        endpoint: https://wus2.codesigning.azure.net/
+        signing-account-name: hanselman
+        certificate-profile-name: WindowsEdgeLight
+        files-folder: artifacts/msix-arm64
+        files-folder-filter: msix
+        files-folder-depth: 3
+        file-digest: SHA256
+        timestamp-rfc3161: http://timestamp.acs.microsoft.com
+        timestamp-digest: SHA256
+
+    # Create ZIP files for Updatum auto-update (needs "win-x64" in filename)
+    - name: Create Release ZIPs
+      run: |
+        Compress-Archive -Path artifacts/tray-win-x64/* -DestinationPath OpenClawTray-${{ needs.test.outputs.majorMinorPatch }}-win-x64.zip
+        Compress-Archive -Path artifacts/tray-win-arm64/* -DestinationPath OpenClawTray-${{ needs.test.outputs.majorMinorPatch }}-win-arm64.zip
+
+    # Inno Setup installer for x64
+    - name: Install Inno Setup
+      run: choco install innosetup -y
+
+    - name: Build x64 Installer
+      run: |
+        # Prepare x64 files
+        mkdir publish-x64
+        copy artifacts/tray-win-x64/* publish-x64/ -Recurse
+        mkdir publish-x64\cmdpal
+        $manifestFolder = Get-ChildItem -Path "artifacts/cmdpal-x64" -Recurse -Filter "AppxManifest.xml" | Select-Object -First 1
+        if ($manifestFolder) {
+          Copy-Item "$($manifestFolder.DirectoryName)\*" -Destination publish-x64\cmdpal -Recurse
+        }
+        # Build installer
+        & "C:\Program Files (x86)\Inno Setup 6\ISCC.exe" /DMyAppVersion=${{ needs.test.outputs.majorMinorPatch }} /DMyAppArch=x64 /Dpublish=publish-x64 installer.iss
+
+    - name: Build arm64 Installer
+      run: |
+        # Prepare arm64 files
+        mkdir publish-arm64
+        copy artifacts/tray-win-arm64/* publish-arm64/ -Recurse
+        mkdir publish-arm64\cmdpal
+        $manifestFolder = Get-ChildItem -Path "artifacts/cmdpal-arm64" -Recurse -Filter "AppxManifest.xml" | Select-Object -First 1
+        if ($manifestFolder) {
+          Copy-Item "$($manifestFolder.DirectoryName)\*" -Destination publish-arm64\cmdpal -Recurse
+        }
+        # Build installer
+        & "C:\Program Files (x86)\Inno Setup 6\ISCC.exe" /DMyAppVersion=${{ needs.test.outputs.majorMinorPatch }} /DMyAppArch=arm64 /Dpublish=publish-arm64 installer.iss
+
+    - name: Azure Login for Signing
+      uses: azure/login@v2
+      with:
+        creds: '{"clientId":"${{ secrets.AZURE_CLIENT_ID }}","clientSecret":"${{ secrets.AZURE_CLIENT_SECRET }}","subscriptionId":"${{ secrets.AZURE_SUBSCRIPTION_ID }}","tenantId":"${{ secrets.AZURE_TENANT_ID }}"}'
+
+    - name: Sign Installer
+      uses: azure/trusted-signing-action@v1
+      with:
+        azure-tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+        azure-client-id: ${{ secrets.AZURE_CLIENT_ID }}
+        azure-client-secret: ${{ secrets.AZURE_CLIENT_SECRET }}
+        endpoint: https://wus2.codesigning.azure.net/
+        signing-account-name: hanselman
+        certificate-profile-name: WindowsEdgeLight
+        files-folder: Output
+        files-folder-filter: exe
+        file-digest: SHA256
+        timestamp-rfc3161: http://timestamp.acs.microsoft.com
+        timestamp-digest: SHA256
+
+    - name: Create Release
+      uses: softprops/action-gh-release@v2
+      with:
+        generate_release_notes: true
+        files: |
+          Output/OpenClawTray-Setup-x64.exe
+          Output/OpenClawTray-Setup-arm64.exe
+          OpenClawTray-${{ needs.test.outputs.majorMinorPatch }}-win-x64.zip
+          OpenClawTray-${{ needs.test.outputs.majorMinorPatch }}-win-arm64.zip
+          OpenClawTray-${{ needs.test.outputs.majorMinorPatch }}-win-x64.msix
+          OpenClawTray-${{ needs.test.outputs.majorMinorPatch }}-win-arm64.msix
+        body: |
+          ## OpenClaw Windows Hub ${{ github.ref_name }}
+
+          ### Downloads
+          - **Installer (x64)**: `OpenClawTray-Setup-x64.exe` - Intel/AMD 64-bit
+          - **Installer (ARM64)**: `OpenClawTray-Setup-arm64.exe` - Windows on ARM (Surface, etc.)
+          - **Portable x64**: `OpenClawTray-${{ needs.test.outputs.majorMinorPatch }}-win-x64.zip`
+          - **Portable ARM64**: `OpenClawTray-${{ needs.test.outputs.majorMinorPatch }}-win-arm64.zip`
+          - **MSIX x64**: `OpenClawTray-${{ needs.test.outputs.majorMinorPatch }}-win-x64.msix` - Packaged (camera/mic consent)
+          - **MSIX ARM64**: `OpenClawTray-${{ needs.test.outputs.majorMinorPatch }}-win-arm64.msix` - Packaged (camera/mic consent)
+
+          ### Features
+          - 🦞 System tray integration with gateway status
+          - 🎯 PowerToys Command Palette extension (optional)
+          - 🔄 Auto-updates from GitHub Releases
+          - ✅ Code-signed with Azure Trusted Signing
+          - 📦 MSIX package available for native camera/microphone consent prompts
+
+          ### Requirements
+          - Windows 10 version 1903 or later
+          - [WebView2 Runtime](https://developer.microsoft.com/en-us/microsoft-edge/webview2/)
+          - OpenClaw gateway running locally
+          - PowerToys (for Command Palette extension)
+
+          ### Quick Start
+          1. Run the installer for your architecture (or sideload the MSIX for camera consent)
+          2. Optionally enable Command Palette extension during install
+          3. Launch from Start Menu or system tray
+          4. Right-click tray icon → Settings to configure
