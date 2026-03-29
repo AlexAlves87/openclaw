@@ -72,6 +72,9 @@ public partial class App : Application
     
     // Node service (optional, enabled in settings)
     private NodeService? _nodeService;
+
+    // Gateway process manager (spawns/monitors the local openclaw gateway)
+    private GatewayProcessManager? _gatewayProcessManager;
     
     // Keep-alive window to anchor WinUI runtime (prevents GC/threading issues)
     private Window? _keepAliveWindow;
@@ -260,6 +263,10 @@ public partial class App : Application
         // Initialize tray icon (window-less pattern from WinUIEx)
         InitializeTrayIcon();
         ShowSurfaceImprovementsTipIfNeeded();
+
+        // Start gateway process manager (attaches to existing or spawns a new one)
+        _gatewayProcessManager = new GatewayProcessManager(new AppLogger());
+        _gatewayProcessManager.Start();
 
         // Initialize connections - only use operator if node mode is disabled
         // (dual connections cause gateway conflicts)
@@ -2063,6 +2070,9 @@ public partial class App : Application
         // Unsubscribe and dispose gateway client
         UnsubscribeGatewayEvents();
         _gatewayClient?.Dispose();
+
+        // Stop gateway process manager
+        _gatewayProcessManager?.Dispose();
         
         // Dispose tray and mutex
         _trayIcon?.Dispose();
