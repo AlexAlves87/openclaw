@@ -30,7 +30,7 @@ public sealed class GatewayProcessManager : IDisposable
     private const int LogLimitChars        = 20_000;
     private const int HealthProbeTimeoutMs = 2_000;
     private const int StartupPollIntervalMs = 400;
-    private const int StartupTimeoutSeconds = 6;
+    private const int StartupTimeoutSeconds = 15;
     private const int AttachProbeTimeoutMs = 500;
     private const int AttachRetryIntervalMs = 250;
     private const int AttachMaxAttempts    = 3;
@@ -276,6 +276,20 @@ public sealed class GatewayProcessManager : IDisposable
             }
 
             await Task.Delay(StartupPollIntervalMs).ConfigureAwait(false);
+        }
+
+        // Timeout reached — do one final probe before marking as failed.
+        // The gateway may have started slightly after the deadline.
+        if (await CanConnectToPortAsync(port, HealthProbeTimeoutMs).ConfigureAwait(false))
+        {
+            int? pid = null;
+            lock (_lock) { try { pid = _gatewayProcess?.Id; } catch { } }
+            var details = pid.HasValue ? $"pid {pid}" : "ok";
+            SetStatus(GatewayProcessState.Running, $"Running ({details})");
+            AppendLog($"[gateway] started (late): {details}\n");
+            _logger.Info($"[GatewayProcessManager] Gateway started (late): {details}");
+            RefreshLog();
+            return;
         }
 
         SetStatus(GatewayProcessState.Failed, "Gateway did not start in time");
