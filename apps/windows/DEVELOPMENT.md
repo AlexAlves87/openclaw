@@ -5,6 +5,7 @@ A comprehensive guide for building, running, and contributing to the OpenClaw Wi
 ## Table of Contents
 
 - [Prerequisites](#prerequisites)
+- [Installation](#installation)
 - [Project Structure](#project-structure)
 - [Building](#building)
 - [Architecture Overview](#architecture-overview)
@@ -31,6 +32,58 @@ A comprehensive guide for building, running, and contributing to the OpenClaw Wi
 
 - **PowerToys** (latest version) - Required for testing the Command Palette extension
   - [Download PowerToys](https://github.com/microsoft/PowerToys)
+
+## Installation
+
+### Install from Installer (Recommended)
+
+Download the latest release from [GitHub Releases](https://github.com/openclaw/openclaw/releases):
+
+- `OpenClawTray-Setup-x64.exe` — Intel/AMD 64-bit
+- `OpenClawTray-Setup-arm64.exe` — Windows on ARM (Surface, Snapdragon X)
+
+Run the installer and follow the prompts. It installs the Tray app, optionally the PowerToys Command Palette extension, creates a Start Menu shortcut, and can configure the app to launch at Windows startup.
+
+**Requirements:** Windows 10 version 1903 or later, [WebView2 Runtime](https://developer.microsoft.com/microsoft-edge/webview2/) (pre-installed on modern Windows).
+
+### Install via MSIX (Camera & Microphone Consent)
+
+The MSIX package enables the native Windows camera and microphone consent prompts required by the `camera.snap` capability in Node Mode.
+
+Download `OpenClawTray-{version}-win-x64.msix` (or the ARM64 variant), then:
+
+```powershell
+Add-AppxPackage OpenClawTray-{version}-win-x64.msix
+```
+
+Or double-click the `.msix` file in Explorer.
+
+### Update
+
+The app updates automatically via [Updatum](https://github.com/coderaw/Updatum). On startup it checks GitHub Releases; when a new version is available, a notification appears with an **Update** button. The app downloads, installs, and restarts automatically.
+
+To update manually: download the new installer from [GitHub Releases](https://github.com/openclaw/openclaw/releases) and run it over the existing installation.
+
+### Uninstall
+
+**Installer:**
+
+1. Open **Settings > Apps > Installed apps**
+2. Search for **OpenClaw Windows Hub**
+3. Click the `···` menu → **Uninstall**
+
+**MSIX:**
+
+```powershell
+Get-AppxPackage *OpenClaw* | Remove-AppxPackage
+```
+
+**Data cleanup (optional):** uninstalling does not remove user data. To clean up fully:
+
+```powershell
+Remove-Item -Recurse "$env:APPDATA\OpenClawTray"       # Settings
+Remove-Item -Recurse "$env:LOCALAPPDATA\OpenClawTray"  # Logs, WebView2 cache
+```
 
 ## Project Structure
 
