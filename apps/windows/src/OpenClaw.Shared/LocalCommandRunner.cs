@@ -171,7 +171,11 @@ public class LocalCommandRunner : ICommandRunner
         
         if (request.Args is { Length: > 0 })
         {
-            command = command + " " + string.Join(" ", request.Args.Select(a => ShellQuoting.QuoteForShell(a, isCmd)));
+            // Quote argv[0] too — an absolute path like "C:\Program Files\Git\bin\git.exe"
+            // contains spaces and would be parsed as two tokens by PowerShell/cmd without quoting.
+            command = ShellQuoting.QuoteForShell(command, isCmd)
+                      + " "
+                      + string.Join(" ", request.Args.Select(a => ShellQuoting.QuoteForShell(a, isCmd)));
         }
         
         return shell switch

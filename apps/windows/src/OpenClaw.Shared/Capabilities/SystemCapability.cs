@@ -190,15 +190,29 @@ public class SystemCapability : NodeCapabilityBase
             else if (cmdEl.ValueKind == System.Text.Json.JsonValueKind.String)
             {
                 command = cmdEl.GetString();
-                argv = command != null ? new[] { command } : null;
+                // Mirror HandleRunAsync: also check for a separate "args" array so that
+                // {"command":"git","args":["reset","--hard"]} produces an accurate approval
+                // plan rather than showing just "git" while executing "git reset --hard".
+                var argsList = command != null ? new List<string> { command } : new List<string>();
+                if (command != null &&
+                    request.Args.TryGetProperty("args", out var argsEl) &&
+                    argsEl.ValueKind == System.Text.Json.JsonValueKind.Array)
+                {
+                    foreach (var item in argsEl.EnumerateArray())
+                    {
+                        if (item.ValueKind == System.Text.Json.JsonValueKind.String)
+                            argsList.Add(item.GetString() ?? "");
+                    }
+                }
+                argv = argsList.Count > 0 ? argsList.ToArray() : null;
             }
         }
-        
+
         if (string.IsNullOrWhiteSpace(command) || argv == null || argv.Length == 0)
         {
             return Error("Missing command parameter");
         }
-        
+
         rawCommand = GetStringArg(request.Args, "rawCommand");
         cwd = GetStringArg(request.Args, "cwd");
         var agentId = GetStringArg(request.Args, "agentId");
